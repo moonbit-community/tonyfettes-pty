@@ -1,0 +1,7 @@
+# MoonBit
+_build/
+.mooncakes/
+.moonagent/
+
+# macOS
+.DS_Store
