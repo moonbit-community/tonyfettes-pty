@@ -5,3 +5,6 @@ _build/
 
 # macOS
 .DS_Store
+
+# clangd
+compile_flags.txt
