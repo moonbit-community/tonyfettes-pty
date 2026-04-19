@@ -1,5 +1,5 @@
 ///|
-type PtyHandle
+priv type PtyHandle
 
 ///|
 #borrow(argv_flat)

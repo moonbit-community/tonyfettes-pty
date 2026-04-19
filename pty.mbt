@@ -14,10 +14,10 @@ pub suberror PtyError {
 /// can use intent-revealing names, and so that a future Windows build
 /// can point them at the separate input/output pipe HANDLEs without
 /// disturbing callers.
-pub struct Pty {
-  priv handle : PtyHandle
-  priv read_io : @raw_fd.RawFd
-  priv write_io : @raw_fd.RawFd
+struct Pty {
+  handle : PtyHandle
+  read_io : @raw_fd.RawFd
+  write_io : @raw_fd.RawFd
 }
 
 ///|
