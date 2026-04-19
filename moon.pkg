@@ -1,3 +1,18 @@
 import {
-  "moonbitlang/async/pipe",
+  "moonbitlang/core/buffer",
+  "moonbitlang/core/debug",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/async/raw_fd" @raw_fd,
+  "moonbitlang/async/types",
 }
+
+import {
+  "moonbitlang/async",
+} for "test"
+
+supported_targets = "native"
+
+options(
+  "native-stub": [ "pty_stub.c" ],
+  targets: { "ffi.mbt": [ "native" ], "pty_test.mbt": [ "native" ] },
+)
