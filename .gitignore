@@ -2,6 +2,7 @@
 _build/
 .mooncakes/
 .moonagent/
+.repos/
 
 # macOS
 .DS_Store
