@@ -29,8 +29,4 @@ extern "c" fn pty_child_pid(handle : PtyHandle) -> Int = "moonbit_pty_child_pid"
 
 ///|
 #borrow(handle)
-extern "c" fn pty_try_wait(handle : PtyHandle) -> Int = "moonbit_pty_try_wait"
-
-///|
-#borrow(handle)
 extern "c" fn pty_close(handle : PtyHandle) -> Unit = "moonbit_pty_close"

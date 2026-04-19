@@ -648,20 +648,6 @@ int32_t moonbit_pty_child_pid(MoonBitPty *p) {
     return (int32_t)p->handle->spawned_pid;
 }
 
-MOONBIT_FFI_EXPORT
-int32_t moonbit_pty_try_wait(MoonBitPty *p) {
-    if (!p || !p->handle) return -1;
-    pty_refresh_child_status(p->handle);
-    if (!p->handle->child_exited) return -2;
-    if (WIFEXITED(p->handle->child_status)) {
-        return (int32_t)WEXITSTATUS(p->handle->child_status);
-    }
-    if (WIFSIGNALED(p->handle->child_status)) {
-        return 128 + (int32_t)WTERMSIG(p->handle->child_status);
-    }
-    return -1;
-}
-
 /* ---- close -------------------------------------------------------------- */
 
 MOONBIT_FFI_EXPORT
@@ -961,17 +947,6 @@ MOONBIT_FFI_EXPORT
 int32_t moonbit_pty_child_pid(MoonBitPty *p) {
     if (!p || !p->handle || !p->handle->proc_handle) return -1;
     return (int32_t)GetProcessId(p->handle->proc_handle);
-}
-
-MOONBIT_FFI_EXPORT
-int32_t moonbit_pty_try_wait(MoonBitPty *p) {
-    if (!p || !p->handle || !p->handle->proc_handle) return -1;
-    DWORD exit_code;
-    if (WaitForSingleObject(p->handle->proc_handle, 0) == WAIT_OBJECT_0 &&
-        GetExitCodeProcess(p->handle->proc_handle, &exit_code)) {
-        return (int32_t)exit_code;
-    }
-    return -2; /* still running */
 }
 
 /* ---- close -------------------------------------------------------------- */

@@ -16,7 +16,6 @@ let reader = pty.reader()                 // @raw_fd.RawFd
 pty.write(@utf8.encode("ls\n"))           // async
 pty.resize(120, 40)
 let pid : Int = pty.pid()
-let exit : Int? = pty.try_exit_code()     // None while running
 ```
 
 `Pty::spawn` registers the master fd with the async event loop, so it must be

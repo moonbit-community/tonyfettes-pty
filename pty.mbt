@@ -140,19 +140,6 @@ pub fn Pty::pid(self : Pty) -> Int {
 }
 
 ///|
-/// Return the child exit code if it has already terminated.
-///
-/// Returns `None` while the child is still running.
-pub fn Pty::try_exit_code(self : Pty) -> Int? {
-  let code = pty_try_wait(self.handle)
-  if code == -2 {
-    None
-  } else {
-    Some(code)
-  }
-}
-
-///|
 /// Close the PTY, releasing all resources.
 ///
 /// Closes the owned `RawFd` wrapper(s) and then tears down the underlying
