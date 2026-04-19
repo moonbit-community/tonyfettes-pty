@@ -51,11 +51,11 @@ pub async fn Pty::spawn(
     buf.write_byte(b'\x00')
   }
   let argv_flat = buf.contents()
-  let handle = pty_spawn_ffi(argv_flat, argv.length(), cols, rows)
+  let handle = pty_spawn(argv_flat, argv.length(), cols, rows)
   // Transfer fd ownership from the C PTY handle to `RawFd`.
-  let read_io = @raw_fd.RawFd::new(pty_take_read_fd_ffi(handle)) catch {
+  let read_io = @raw_fd.RawFd::new(pty_take_read_fd(handle)) catch {
     err => {
-      pty_close_ffi(handle)
+      pty_close(handle)
       raise SpawnFailed("RawFd setup failed (read): \{@debug.to_string(err)}")
     }
   }
@@ -80,10 +80,10 @@ fn register_write_io(
   handle : PtyHandle,
   read_io : @raw_fd.RawFd,
 ) -> @raw_fd.RawFd raise PtyError {
-  let write_io = @raw_fd.RawFd::new(pty_take_write_fd_ffi(handle)) catch {
+  let write_io = @raw_fd.RawFd::new(pty_take_write_fd(handle)) catch {
     err => {
       read_io.close()
-      pty_close_ffi(handle)
+      pty_close(handle)
       raise SpawnFailed("RawFd setup failed (write): \{@debug.to_string(err)}")
     }
   }
@@ -127,7 +127,7 @@ pub async fn Pty::write(self : Pty, data : Bytes) -> Unit raise PtyError {
 ///
 /// Raises `PtyError::ResizeError` if the resize fails.
 pub fn Pty::resize(self : Pty, cols : Int, rows : Int) -> Unit raise PtyError {
-  let rc = pty_resize_ffi(self.handle, cols, rows)
+  let rc = pty_resize(self.handle, cols, rows)
   if rc < 0 {
     raise ResizeError
   }
@@ -136,7 +136,7 @@ pub fn Pty::resize(self : Pty, cols : Int, rows : Int) -> Unit raise PtyError {
 ///|
 /// Get the spawned child PID when available.
 pub fn Pty::pid(self : Pty) -> Int {
-  pty_child_pid_ffi(self.handle)
+  pty_child_pid(self.handle)
 }
 
 ///|
@@ -144,7 +144,7 @@ pub fn Pty::pid(self : Pty) -> Int {
 ///
 /// Returns `None` while the child is still running.
 pub fn Pty::try_exit_code(self : Pty) -> Int? {
-  let code = pty_try_wait_ffi(self.handle)
+  let code = pty_try_wait(self.handle)
   if code == -2 {
     None
   } else {
@@ -163,7 +163,7 @@ pub fn Pty::try_exit_code(self : Pty) -> Int? {
 #cfg(not(platform="windows"))
 pub fn Pty::close(self : Pty) -> Unit {
   self.read_io.close()
-  pty_close_ffi(self.handle)
+  pty_close(self.handle)
 }
 
 ///|
@@ -178,5 +178,5 @@ pub fn Pty::close(self : Pty) -> Unit {
 pub fn Pty::close(self : Pty) -> Unit {
   self.read_io.close()
   self.write_io.close()
-  pty_close_ffi(self.handle)
+  pty_close(self.handle)
 }
