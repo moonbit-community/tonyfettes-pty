@@ -1,11 +1,4 @@
 ///|
-pub suberror PtyError {
-  SpawnFailed(String)
-  WriteError
-  ResizeError
-} derive(Debug)
-
-///|
 /// Handle to a spawned PTY plus its event-loop registration.
 ///
 /// On Unix the PTY master fd is used for both reading and writing, so
@@ -21,6 +14,11 @@ struct Pty {
 }
 
 ///|
+/// POSIX `EINVAL`. Used as the error code when `argv` is empty —
+/// `@os_error.errno_to_string` renders it as "Invalid argument".
+const EINVAL : Int = 22
+
+///|
 /// Spawn a new PTY running the given program.
 ///
 /// `argv[0]` is the program to execute (resolved via PATH by `execvp`),
@@ -32,14 +30,15 @@ struct Pty {
 /// master fd is registered with the event loop on construction so that
 /// reads and writes can suspend instead of blocking the thread.
 ///
-/// Returns a `Pty` handle or raises `PtyError::SpawnFailed` on failure.
+/// Raises `@os_error.OSError` wrapping `errno` (Unix) or `GetLastError()`
+/// (Windows) if the underlying syscall fails.
 pub async fn Pty::spawn(
   argv : Array[String],
   cols? : Int = 80,
   rows? : Int = 24,
-) -> Pty raise PtyError {
-  if argv.length() == 0 {
-    raise SpawnFailed("empty argv")
+) -> Pty {
+  if argv.is_empty() {
+    raise @os_error.OSError(EINVAL, context="Pty::spawn: empty argv")
   }
   // Flatten argv into a single null-separated byte buffer:
   //   "arg0\0arg1\0...argN\0"
@@ -52,11 +51,16 @@ pub async fn Pty::spawn(
   }
   let argv_flat = buf.contents()
   let handle = pty_spawn(argv_flat, argv.length(), cols, rows)
+  let spawn_err = pty_check_spawn(handle)
+  if spawn_err != 0 {
+    pty_close(handle)
+    raise @os_error.OSError(spawn_err, context="Pty::spawn")
+  }
   // Transfer fd ownership from the C PTY handle to `RawFd`.
   let read_io = @raw_fd.RawFd::new(pty_take_read_fd(handle)) catch {
     err => {
       pty_close(handle)
-      raise SpawnFailed("RawFd setup failed (read): \{@debug.to_string(err)}")
+      raise err
     }
   }
   let write_io = register_write_io(handle, read_io)
@@ -79,15 +83,14 @@ fn register_write_io(
 fn register_write_io(
   handle : PtyHandle,
   read_io : @raw_fd.RawFd,
-) -> @raw_fd.RawFd raise PtyError {
-  let write_io = @raw_fd.RawFd::new(pty_take_write_fd(handle)) catch {
+) -> @raw_fd.RawFd {
+  @raw_fd.RawFd::new(pty_take_write_fd(handle)) catch {
     err => {
       read_io.close()
       pty_close(handle)
-      raise SpawnFailed("RawFd setup failed (write): \{@debug.to_string(err)}")
+      raise err
     }
   }
-  write_io
 }
 
 ///|
@@ -107,16 +110,14 @@ pub fn Pty::reader(self : Pty) -> @raw_fd.RawFd {
 /// implementation, this does not stall other concurrent tasks when the
 /// child stops draining the PTY input buffer.
 ///
-/// Raises `PtyError::WriteError` if the write fails.
-pub async fn Pty::write(self : Pty, data : Bytes) -> Unit raise PtyError {
+/// Raises `@os_error.OSError` if the underlying write fails.
+pub async fn Pty::write(self : Pty, data : Bytes) -> Unit {
   let total = data.length()
   let mut offset = 0
   while offset < total {
-    let n = self.write_io.write(data, offset~, len=total - offset) catch {
-      _ => raise WriteError
-    }
+    let n = self.write_io.write(data, offset~, len=total - offset)
     if n <= 0 {
-      raise WriteError
+      raise @os_error.OSError(EINVAL, context="Pty::write: short write")
     }
     offset += n
   }
@@ -125,11 +126,16 @@ pub async fn Pty::write(self : Pty, data : Bytes) -> Unit raise PtyError {
 ///|
 /// Resize the PTY window.
 ///
-/// Raises `PtyError::ResizeError` if the resize fails.
-pub fn Pty::resize(self : Pty, cols : Int, rows : Int) -> Unit raise PtyError {
-  let rc = pty_resize(self.handle, cols, rows)
-  if rc < 0 {
-    raise ResizeError
+/// Raises `@os_error.OSError` if the underlying syscall fails.
+pub fn Pty::resize(
+  self : Pty,
+  cols : Int,
+  rows : Int,
+) -> Unit raise @os_error.OSError {
+  // Explicitly narrowed: pty_resize is the only source of error here.
+  let err = pty_resize(self.handle, cols, rows)
+  if err != 0 {
+    raise @os_error.OSError(err, context="Pty::resize")
   }
 }
 

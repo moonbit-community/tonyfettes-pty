@@ -11,6 +11,12 @@ extern "c" fn pty_spawn(
 ) -> PtyHandle = "moonbit_pty_spawn"
 
 ///|
+/// Returns the OS error captured during `pty_spawn` (0 = success).
+/// The value is `errno` on Unix / `GetLastError()` on Windows.
+#borrow(handle)
+extern "c" fn pty_check_spawn(handle : PtyHandle) -> Int = "moonbit_pty_check_spawn"
+
+///|
 #borrow(handle)
 extern "c" fn pty_resize(handle : PtyHandle, cols : Int, rows : Int) -> Int = "moonbit_pty_resize"
 

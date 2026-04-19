@@ -37,14 +37,55 @@ typedef struct pty_handle {
 /*
  * MoonBitPty is the external-object wrapper seen by MoonBit.
  * moonbit_make_external_object allocates (payload_size) bytes after
- * the GC header; our payload is a single pointer to pty_handle_t.
+ * the GC header; our payload is (pty_handle_t *, spawn_errno).
+ *
+ * `spawn_errno` is 0 on success, otherwise the errno / GetLastError
+ * captured at the point moonbit_pty_spawn failed. On failure, `handle`
+ * is NULL, but the MoonBitPty object itself is still valid so MoonBit
+ * can call moonbit_pty_check_spawn / moonbit_pty_close on it.
  */
 typedef struct {
     pty_handle_t *handle;
+    int32_t spawn_errno;
 } MoonBitPty;
 
 /* Forward declaration of the platform close helper. */
 static void pty_close_impl(pty_handle_t *h);
+static void moonbit_pty_finalizer(void *ptr);
+
+/* Allocate a MoonBitPty representing a failed spawn. `handle` stays NULL;
+ * `err` stores the captured OS error (errno on Unix, GetLastError on
+ * Windows) so MoonBit can report it via moonbit_pty_check_spawn. */
+static MoonBitPty *pty_make_failure(int32_t err) {
+    MoonBitPty *p = (MoonBitPty *)moonbit_make_external_object(
+        moonbit_pty_finalizer, sizeof(MoonBitPty)
+    );
+    p->handle = NULL;
+    p->spawn_errno = err;
+    return p;
+}
+
+/* Allocate a MoonBitPty wrapping a successfully-initialized handle. */
+static MoonBitPty *pty_make_success(pty_handle_t *h) {
+    MoonBitPty *p = (MoonBitPty *)moonbit_make_external_object(
+        moonbit_pty_finalizer, sizeof(MoonBitPty)
+    );
+    p->handle = h;
+    p->spawn_errno = 0;
+    return p;
+}
+
+/*
+ * Return the OS error captured during moonbit_pty_spawn. 0 = success.
+ *
+ * The value is errno on Unix / GetLastError on Windows (same convention
+ * as @os_error.get_errno), so MoonBit can wrap it directly in an OSError.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonbit_pty_check_spawn(MoonBitPty *p) {
+    if (!p) return 0;
+    return p->spawn_errno;
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Cross-platform argv plumbing                                              */
@@ -405,9 +446,10 @@ static MoonBitPty *pty_spawn_via_self_helper(
     char **target_argv = pty_parse_argv_flat(argv_flat, argc);
     char *self_path = pty_get_self_executable_path();
     if (!target_argv || !self_path) {
+        int32_t saved = (int32_t)(errno ? errno : ENOMEM);
         pty_free_argv(target_argv);
         free(self_path);
-        return NULL;
+        return pty_make_failure(saved);
     }
 
     struct winsize ws;
@@ -418,39 +460,42 @@ static MoonBitPty *pty_spawn_via_self_helper(
     int master_fd = -1;
     int slave_fd = -1;
     if (openpty(&master_fd, &slave_fd, NULL, NULL, &ws) < 0) {
+        int32_t saved = (int32_t)errno;
         pty_free_argv(target_argv);
         free(self_path);
-        return NULL;
+        return pty_make_failure(saved);
     }
 
     pty_set_nonblocking(master_fd);
 
     posix_spawn_file_actions_t file_actions;
     posix_spawnattr_t attr;
-    if (posix_spawn_file_actions_init(&file_actions) != 0) {
+    int spawn_err = posix_spawn_file_actions_init(&file_actions);
+    if (spawn_err != 0) {
         close(master_fd);
         close(slave_fd);
         pty_free_argv(target_argv);
         free(self_path);
-        return NULL;
+        return pty_make_failure((int32_t)spawn_err);
     }
-    if (posix_spawnattr_init(&attr) != 0) {
+    spawn_err = posix_spawnattr_init(&attr);
+    if (spawn_err != 0) {
         posix_spawn_file_actions_destroy(&file_actions);
         close(master_fd);
         close(slave_fd);
         pty_free_argv(target_argv);
         free(self_path);
-        return NULL;
+        return pty_make_failure((int32_t)spawn_err);
     }
 
-    int spawn_err = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    spawn_err = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
     if (spawn_err == 0) {
         spawn_err = posix_spawn_file_actions_addinherit_np(&file_actions, slave_fd);
     }
 
-    /* spawn_argv is argv for the *self-reexec* (tun-server binary being
-     * re-run as a constructor helper); target_argv is what we want the
-     * constructor to execvp once it's running. */
+    /* spawn_argv is argv for the *self-reexec* (same binary being re-run as
+     * a constructor helper); target_argv is what we want the constructor to
+     * execvp once it's running. */
     char **spawn_argv = pty_make_spawn_argv(self_path);
     char **child_env = pty_make_spawn_env(slave_fd, argc, target_argv);
     if (!spawn_argv || !child_env) {
@@ -472,24 +517,20 @@ static MoonBitPty *pty_spawn_via_self_helper(
 
     if (spawn_err != 0) {
         close(master_fd);
-        return NULL;
+        return pty_make_failure((int32_t)spawn_err);
     }
 
     pty_handle_t *h = (pty_handle_t *)calloc(1, sizeof(pty_handle_t));
     if (!h) {
         close(master_fd);
         kill(pid, SIGHUP);
-        return NULL;
+        return pty_make_failure((int32_t)ENOMEM);
     }
     h->master_fd = master_fd;
     h->spawned_pid = (int)pid;
     h->child_pid = (int)pid;
 
-    MoonBitPty *p = (MoonBitPty *)moonbit_make_external_object(
-        moonbit_pty_finalizer, sizeof(pty_handle_t *)
-    );
-    p->handle = h;
-    return p;
+    return pty_make_success(h);
 }
 #endif
 
@@ -535,7 +576,7 @@ MoonBitPty *moonbit_pty_spawn(
     /* Parse argv in the parent BEFORE fork so allocation failures are
      * recoverable; the child inherits the parsed memory via COW. */
     char **child_argv = pty_parse_argv_flat(argv_flat, argc);
-    if (!child_argv) return NULL;
+    if (!child_argv) return pty_make_failure((int32_t)(errno ? errno : ENOMEM));
 
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
@@ -547,8 +588,9 @@ MoonBitPty *moonbit_pty_spawn(
 
     if (pid < 0) {
         /* forkpty failed */
+        int32_t saved = (int32_t)errno;
         pty_free_argv(child_argv);
-        return NULL;
+        return pty_make_failure(saved);
     }
 
     if (pid == 0) {
@@ -581,7 +623,7 @@ MoonBitPty *moonbit_pty_spawn(
     if (!h) {
         close(master_fd);
         kill(pid, SIGHUP);
-        return NULL;
+        return pty_make_failure((int32_t)ENOMEM);
     }
     h->master_fd  = master_fd;
     h->spawned_pid = (int)pid;
@@ -589,12 +631,7 @@ MoonBitPty *moonbit_pty_spawn(
     h->child_exited = 0;
     h->child_status = 0;
 
-    /* Create the MoonBit external object. */
-    MoonBitPty *p = (MoonBitPty *)moonbit_make_external_object(
-        moonbit_pty_finalizer, sizeof(pty_handle_t *)
-    );
-    p->handle = h;
-    return p;
+    return pty_make_success(h);
 #endif
 }
 
@@ -602,14 +639,15 @@ MoonBitPty *moonbit_pty_spawn(
 
 MOONBIT_FFI_EXPORT
 int32_t moonbit_pty_resize(MoonBitPty *p, int32_t cols, int32_t rows) {
-    if (!p || !p->handle || p->handle->master_fd < 0) return -1;
+    if (!p || !p->handle || p->handle->master_fd < 0) return (int32_t)EINVAL;
 
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
     ws.ws_col = (unsigned short)cols;
     ws.ws_row = (unsigned short)rows;
 
-    return (ioctl(p->handle->master_fd, TIOCSWINSZ, &ws) == 0) ? 0 : -1;
+    if (ioctl(p->handle->master_fd, TIOCSWINSZ, &ws) == 0) return 0;
+    return (int32_t)errno;
 }
 
 /* ---- read_fd ------------------------------------------------------------ */
@@ -788,13 +826,17 @@ MOONBIT_FFI_EXPORT
 MoonBitPty *moonbit_pty_spawn(
     const uint8_t *argv_flat, int32_t argc, int32_t cols, int32_t rows
 ) {
-    if (ensure_conpty() < 0) return NULL;
+    int32_t saved_err = 0;
+    if (ensure_conpty() < 0) {
+        /* ConPTY unavailable — no meaningful GetLastError, use a sentinel. */
+        return pty_make_failure((int32_t)ERROR_NOT_SUPPORTED);
+    }
 
     char **parsed_argv = pty_parse_argv_flat(argv_flat, argc);
-    if (!parsed_argv) return NULL;
+    if (!parsed_argv) return pty_make_failure((int32_t)ERROR_NOT_ENOUGH_MEMORY);
     char *cmd_line = pty_join_argv_windows(parsed_argv, argc);
     pty_free_argv(parsed_argv);
-    if (!cmd_line) return NULL;
+    if (!cmd_line) return pty_make_failure((int32_t)ERROR_NOT_ENOUGH_MEMORY);
 
     HANDLE pipe_in_read   = INVALID_HANDLE_VALUE;
     HANDLE pipe_in_write  = INVALID_HANDLE_VALUE;
@@ -803,11 +845,17 @@ MoonBitPty *moonbit_pty_spawn(
 
     /* pipe_in: keyboard → ConPTY stdin. Use overlapped named pipe so the
      * write end can be registered with IOCP for async writes from MoonBit. */
-    if (create_overlapped_pipe(&pipe_in_read, &pipe_in_write) < 0) goto fail;
+    if (create_overlapped_pipe(&pipe_in_read, &pipe_in_write) < 0) {
+        saved_err = (int32_t)GetLastError();
+        goto fail;
+    }
 
     /* pipe_out: ConPTY stdout → our async reader. Use overlapped named pipe
      * so the read end can be registered with IOCP for event-driven reads. */
-    if (create_overlapped_pipe(&pipe_out_read, &pipe_out_write) < 0) goto fail;
+    if (create_overlapped_pipe(&pipe_out_read, &pipe_out_write) < 0) {
+        saved_err = (int32_t)GetLastError();
+        goto fail;
+    }
 
     /* Create the pseudo-console. */
     COORD_T size;
@@ -817,15 +865,22 @@ MoonBitPty *moonbit_pty_spawn(
     void *hpc = NULL;
     HRESULT hr = pfnCreatePseudoConsole(
         size, pipe_in_read, pipe_out_write, 0, &hpc);
-    if (FAILED(hr) || !hpc) goto fail;
+    if (FAILED(hr) || !hpc) {
+        saved_err = (int32_t)hr;
+        goto fail;
+    }
 
     /* Prepare STARTUPINFOEXA with the pseudo-console attribute. */
     SIZE_T attr_size = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
     LPPROC_THREAD_ATTRIBUTE_LIST attr_list =
         (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
-    if (!attr_list) goto fail_close_hpc;
+    if (!attr_list) {
+        saved_err = (int32_t)ERROR_NOT_ENOUGH_MEMORY;
+        goto fail_close_hpc;
+    }
     if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+        saved_err = (int32_t)GetLastError();
         HeapFree(GetProcessHeap(), 0, attr_list);
         goto fail_close_hpc;
     }
@@ -835,6 +890,7 @@ MoonBitPty *moonbit_pty_spawn(
             attr_list, 0,
             (DWORD_PTR)0x00020016,  /* PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE */
             hpc, sizeof(void *), NULL, NULL)) {
+        saved_err = (int32_t)GetLastError();
         DeleteProcThreadAttributeList(attr_list);
         HeapFree(GetProcessHeap(), 0, attr_list);
         goto fail_close_hpc;
@@ -865,11 +921,15 @@ MoonBitPty *moonbit_pty_spawn(
     free(cmd_line);
     cmd_line = NULL;
 
-    if (!ok) goto fail_close_hpc;
+    if (!ok) {
+        saved_err = (int32_t)GetLastError();
+        goto fail_close_hpc;
+    }
 
     /* Build the handle. */
     pty_handle_t *h = (pty_handle_t *)calloc(1, sizeof(pty_handle_t));
     if (!h) {
+        saved_err = (int32_t)ERROR_NOT_ENOUGH_MEMORY;
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -883,11 +943,7 @@ MoonBitPty *moonbit_pty_spawn(
     h->proc_handle    = pi.hProcess;
     h->thread_handle  = pi.hThread;
 
-    MoonBitPty *p = (MoonBitPty *)moonbit_make_external_object(
-        moonbit_pty_finalizer, sizeof(pty_handle_t *)
-    );
-    p->handle = h;
-    return p;
+    return pty_make_success(h);
 
 fail_close_hpc:
     pfnClosePseudoConsole(hpc);
@@ -897,20 +953,20 @@ fail:
     if (pipe_out_read  != INVALID_HANDLE_VALUE) CloseHandle(pipe_out_read);
     if (pipe_out_write != INVALID_HANDLE_VALUE) CloseHandle(pipe_out_write);
     free(cmd_line);
-    return NULL;
+    return pty_make_failure(saved_err);
 }
 
 /* ---- resize ------------------------------------------------------------- */
 
 MOONBIT_FFI_EXPORT
 int32_t moonbit_pty_resize(MoonBitPty *p, int32_t cols, int32_t rows) {
-    if (!p || !p->handle || !p->handle->hpc) return -1;
+    if (!p || !p->handle || !p->handle->hpc) return (int32_t)ERROR_INVALID_PARAMETER;
 
     COORD_T size;
     size.X = (short)cols;
     size.Y = (short)rows;
     HRESULT hr = pfnResizePseudoConsole(p->handle->hpc, size);
-    return SUCCEEDED(hr) ? 0 : -1;
+    return SUCCEEDED(hr) ? 0 : (int32_t)hr;
 }
 
 /* ---- read_fd ------------------------------------------------------------ */

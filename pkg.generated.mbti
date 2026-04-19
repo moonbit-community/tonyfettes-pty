@@ -2,27 +2,22 @@
 package "tonyfettes/pty"
 
 import {
+  "moonbitlang/async/os_error",
   "moonbitlang/async/raw_fd",
-  "moonbitlang/core/debug",
 }
 
 // Values
 
 // Errors
-pub suberror PtyError {
-  SpawnFailed(String)
-  WriteError
-  ResizeError
-} derive(@debug.Debug)
 
 // Types and methods
 type Pty
 pub fn Pty::close(Self) -> Unit
 pub fn Pty::pid(Self) -> Int
 pub fn Pty::reader(Self) -> @raw_fd.RawFd
-pub fn Pty::resize(Self, Int, Int) -> Unit raise PtyError
-pub async fn Pty::spawn(Array[String], cols? : Int, rows? : Int) -> Self raise PtyError
-pub async fn Pty::write(Self, Bytes) -> Unit raise PtyError
+pub fn Pty::resize(Self, Int, Int) -> Unit raise @os_error.OSError
+pub async fn Pty::spawn(Array[String], cols? : Int, rows? : Int) -> Self
+pub async fn Pty::write(Self, Bytes) -> Unit
 
 // Type aliases
 

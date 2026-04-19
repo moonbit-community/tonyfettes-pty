@@ -22,6 +22,22 @@ let pid : Int = pty.pid()
 called from inside an async context. `argv[0]` is resolved via `PATH`
 (`execvp`).
 
+## Errors
+
+Failures are reported as `@moonbitlang/async/os_error.OSError(code, context~)`,
+where `code` is `errno` on Unix or `GetLastError()` on Windows. Use the
+package's `is_EACCES`, `is_ENOENT`, `is_nonblocking_io_error`, etc. predicates
+to branch on specific kinds:
+
+```moonbit
+try {
+  @pty.Pty::spawn(["/bin/missing"])
+} catch {
+  err is @os_error.OSError if err.is_ENOENT() => ...
+  err => raise err
+}
+```
+
 ## Platform strategies
 
 | Platform | Method | Why |

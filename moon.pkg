@@ -1,9 +1,9 @@
 import {
   "moonbitlang/core/buffer",
-  "moonbitlang/core/debug",
   "moonbitlang/core/encoding/utf8",
   "moonbitlang/async/raw_fd" @raw_fd,
   "moonbitlang/async/types",
+  "moonbitlang/async/os_error" @os_error,
 }
 
 import {
