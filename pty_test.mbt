@@ -10,22 +10,24 @@
 async fn read_until_contains(
   pty : Pty,
   needle : String,
-  timeout_ms~ : Int = 1000,
-  max_reads~ : Int = 8,
+  timeout_ms? : Int = 1000,
+  max_reads? : Int = 8,
 ) -> String? {
   let reader = pty.reader()
   let buf : FixedArray[Byte] = FixedArray::make(256, b'\x00')
   let mut output = ""
   let mut found = false
-  @async.with_timeout(timeout_ms, () => for _ in 0..<max_reads {
-    let n = reader.read(buf)
-    if n <= 0 {
-      break
-    }
-    output = output + @utf8.decode(Bytes::from_array(buf[:n]))
-    if output.contains(needle) {
-      found = true
-      break
+  @async.with_timeout(timeout_ms, () => {
+    for _ in 0..<max_reads {
+      let n = reader.read(buf)
+      if n <= 0 {
+        break
+      }
+      output = output + @utf8.decode(Bytes::from_array(buf[:n]))
+      if output.contains(needle) {
+        found = true
+        break
+      }
     }
   })
   if found {

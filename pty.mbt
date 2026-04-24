@@ -42,15 +42,15 @@ pub async fn Pty::spawn(
   }
   // Flatten argv into a single null-separated byte buffer:
   //   "arg0\0arg1\0...argN\0"
-  // The C side walks the buffer using the supplied argc and the embedded
-  // null terminators.
+  // The C side walks the buffer by null byte, using the buffer's own
+  // length to know when to stop.
   let buf = @buffer.new()
   for arg in argv {
     buf.write_bytes(@utf8.encode(arg[:]))
     buf.write_byte(b'\x00')
   }
   let argv_flat = buf.contents()
-  let handle = pty_spawn(argv_flat, argv.length(), cols, rows)
+  let handle = pty_spawn(argv_flat, cols, rows)
   let spawn_err = pty_check_spawn(handle)
   if spawn_err != 0 {
     pty_close(handle)
@@ -106,9 +106,8 @@ pub fn Pty::reader(self : Pty) -> @raw_fd.RawFd {
 /// Write data to the PTY stdin.
 ///
 /// Suspends the current coroutine via the async event loop until all
-/// bytes are written (or a real error occurs). Unlike the old blocking
-/// implementation, this does not stall other concurrent tasks when the
-/// child stops draining the PTY input buffer.
+/// bytes are written, so a stuck child that stops draining its input
+/// buffer won't block other concurrent tasks in the runtime.
 ///
 /// Raises `@os_error.OSError` if the underlying write fails.
 pub async fn Pty::write(self : Pty, data : Bytes) -> Unit {

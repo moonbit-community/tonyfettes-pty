@@ -3,12 +3,7 @@ priv type PtyHandle
 
 ///|
 #borrow(argv_flat)
-extern "c" fn pty_spawn(
-  argv_flat : Bytes,
-  argc : Int,
-  cols : Int,
-  rows : Int,
-) -> PtyHandle = "moonbit_pty_spawn"
+extern "c" fn pty_spawn(argv_flat : Bytes, cols : Int, rows : Int) -> PtyHandle = "moonbit_pty_spawn"
 
 ///|
 /// Returns the OS error captured during `pty_spawn` (0 = success).

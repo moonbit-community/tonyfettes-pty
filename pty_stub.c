@@ -1,7 +1,10 @@
 /*
  * pty_stub.c — Cross-platform PTY implementation for MoonBit FFI.
  *
- * Unix:    forkpty() + fcntl(O_NONBLOCK) + ioctl(TIOCSWINSZ)
+ * Linux:   forkpty() + execvp() with a CLOEXEC error pipe
+ * macOS:   openpty() + posix_spawn() self-helper (mimalloc + fork is
+ *          unsafe on Darwin — see README); argv and exec errno are
+ *          streamed through inherited pipes
  * Windows: ConPTY (dynamically loaded from kernel32.dll)
  *
  * All exported functions use MOONBIT_FFI_EXPORT and follow the
@@ -30,7 +33,6 @@ typedef struct pty_handle {
   int spawned_pid;
   int child_pid;
   int child_exited;
-  int child_status;
 #endif
 } pty_handle_t;
 
@@ -100,8 +102,9 @@ moonbit_pty_check_spawn(MoonBitPty *p) {
 /*
  * Parse the flattened argv buffer into a NULL-terminated char** array.
  *
- * Wire format: "arg0\0arg1\0...arg(argc-1)\0"
- * `argc` gives the number of arguments; the null bytes separate them.
+ * Wire format: "arg0\0arg1\0...arg(n-1)\0" — argc is the count of '\0'
+ * terminators, and the buffer's own length (via Moonbit_array_length)
+ * tells us when to stop.
  *
  * On success returns a newly-allocated argv array that the caller must free
  * with pty_free_argv. Returns NULL on malformed input or allocation failure.
@@ -110,12 +113,21 @@ moonbit_pty_check_spawn(MoonBitPty *p) {
  * the Windows ConPTY path can call it.
  */
 static char **
-pty_parse_argv_flat(const uint8_t *argv_flat, int32_t argc) {
-  if (argc <= 0 || !argv_flat) {
+pty_parse_argv_flat(const uint8_t *argv_flat) {
+  if (!argv_flat) {
     return NULL;
   }
   int32_t flat_len = (int32_t)Moonbit_array_length(argv_flat);
-  if (flat_len <= 0) {
+  if (flat_len <= 0 || argv_flat[flat_len - 1] != 0) {
+    return NULL; /* Empty, or missing trailing null terminator */
+  }
+
+  int32_t argc = 0;
+  for (int32_t i = 0; i < flat_len; i++) {
+    if (argv_flat[i] == 0)
+      argc++;
+  }
+  if (argc == 0) {
     return NULL;
   }
 
@@ -126,20 +138,17 @@ pty_parse_argv_flat(const uint8_t *argv_flat, int32_t argc) {
 
   int32_t pos = 0;
   for (int i = 0; i < argc; i++) {
-    if (pos >= flat_len) {
-      goto fail; /* Ran out of buffer before reading argc args */
-    }
     int32_t end = pos;
-    while (end < flat_len && argv_flat[end] != 0) {
+    while (argv_flat[end] != 0) {
       end++;
-    }
-    if (end >= flat_len) {
-      goto fail; /* Missing null terminator */
     }
     int32_t len = end - pos;
     char *str = (char *)malloc((size_t)len + 1);
     if (!str) {
-      goto fail;
+      for (int j = 0; j < i; j++)
+        free(out[j]);
+      free(out);
+      return NULL;
     }
     memcpy(str, argv_flat + pos, (size_t)len);
     str[len] = '\0';
@@ -148,14 +157,6 @@ pty_parse_argv_flat(const uint8_t *argv_flat, int32_t argc) {
   }
   out[argc] = NULL;
   return out;
-
-fail:
-  for (int i = 0; i < argc; i++) {
-    if (out[i])
-      free(out[i]);
-  }
-  free(out);
-  return NULL;
 }
 
 static void
@@ -586,15 +587,14 @@ pty_free_spawn_env(char **child_env) {
 static MoonBitPty *
 pty_spawn_via_self_helper(
   const uint8_t *argv_flat,
-  int32_t argc,
   int32_t cols,
   int32_t rows
 ) {
-  if (argc <= 0 || !argv_flat) {
+  if (!argv_flat) {
     return pty_make_failure((int32_t)EINVAL);
   }
   int32_t flat_len = (int32_t)Moonbit_array_length(argv_flat);
-  if (flat_len <= 0) {
+  if (flat_len <= 0 || argv_flat[flat_len - 1] != 0) {
     return pty_make_failure((int32_t)EINVAL);
   }
 
@@ -769,7 +769,6 @@ pty_refresh_child_status(pty_handle_t *h) {
   pid_t ret = waitpid(h->child_pid, &status, WNOHANG);
   if (ret == h->child_pid) {
     h->child_exited = 1;
-    h->child_status = status;
     h->child_pid = -1;
   }
 }
@@ -793,20 +792,15 @@ pty_close_impl(pty_handle_t *h) {
 
 MOONBIT_FFI_EXPORT
 MoonBitPty *
-moonbit_pty_spawn(
-  const uint8_t *argv_flat,
-  int32_t argc,
-  int32_t cols,
-  int32_t rows
-) {
+moonbit_pty_spawn(const uint8_t *argv_flat, int32_t cols, int32_t rows) {
 #if defined(__APPLE__)
-  return pty_spawn_via_self_helper(argv_flat, argc, cols, rows);
+  return pty_spawn_via_self_helper(argv_flat, cols, rows);
 #else
   /* Parse argv in the parent BEFORE fork so allocation failures are
    * recoverable; the child inherits the parsed memory via COW. */
-  char **child_argv = pty_parse_argv_flat(argv_flat, argc);
+  char **child_argv = pty_parse_argv_flat(argv_flat);
   if (!child_argv)
-    return pty_make_failure((int32_t)(errno ? errno : ENOMEM));
+    return pty_make_failure((int32_t)(errno ? errno : EINVAL));
 
   /* CLOEXEC error pipe: the child writes its errno to this pipe on any
    * pre-exec failure, and a successful execvp auto-closes the write end
@@ -886,7 +880,6 @@ moonbit_pty_spawn(
   h->spawned_pid = (int)pid;
   h->child_pid = (int)pid;
   h->child_exited = 0;
-  h->child_status = 0;
 
   return pty_make_success(h);
 #endif
@@ -1084,18 +1077,18 @@ pty_close_impl(pty_handle_t *h) {
  * https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args#parsing-c-command-line-arguments
  */
 static char *
-pty_join_argv_windows(char **argv, int argc) {
-  if (argc <= 0)
+pty_join_argv_windows(char **argv) {
+  if (!argv || !argv[0])
     return NULL;
   size_t total = 0;
-  for (int i = 0; i < argc; i++) {
+  for (int i = 0; argv[i]; i++) {
     total += strlen(argv[i]) + 1; /* +1 for space or terminator */
   }
   char *out = (char *)malloc(total);
   if (!out)
     return NULL;
   size_t pos = 0;
-  for (int i = 0; i < argc; i++) {
+  for (int i = 0; argv[i]; i++) {
     size_t len = strlen(argv[i]);
     if (i > 0) {
       out[pos++] = ' ';
@@ -1111,22 +1104,17 @@ pty_join_argv_windows(char **argv, int argc) {
 
 MOONBIT_FFI_EXPORT
 MoonBitPty *
-moonbit_pty_spawn(
-  const uint8_t *argv_flat,
-  int32_t argc,
-  int32_t cols,
-  int32_t rows
-) {
+moonbit_pty_spawn(const uint8_t *argv_flat, int32_t cols, int32_t rows) {
   int32_t saved_err = 0;
   if (ensure_conpty() < 0) {
     /* ConPTY unavailable — no meaningful GetLastError, use a sentinel. */
     return pty_make_failure((int32_t)ERROR_NOT_SUPPORTED);
   }
 
-  char **parsed_argv = pty_parse_argv_flat(argv_flat, argc);
+  char **parsed_argv = pty_parse_argv_flat(argv_flat);
   if (!parsed_argv)
     return pty_make_failure((int32_t)ERROR_NOT_ENOUGH_MEMORY);
-  char *cmd_line = pty_join_argv_windows(parsed_argv, argc);
+  char *cmd_line = pty_join_argv_windows(parsed_argv);
   pty_free_argv(parsed_argv);
   if (!cmd_line)
     return pty_make_failure((int32_t)ERROR_NOT_ENOUGH_MEMORY);
