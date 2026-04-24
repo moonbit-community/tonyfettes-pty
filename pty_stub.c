@@ -914,22 +914,6 @@ moonbit_pty_resize(MoonBitPty *p, int32_t cols, int32_t rows) {
 
 MOONBIT_FFI_EXPORT
 int32_t
-moonbit_pty_read_fd(MoonBitPty *p) {
-  if (!p || !p->handle)
-    return -1;
-  return (int32_t)p->handle->master_fd;
-}
-
-MOONBIT_FFI_EXPORT
-int32_t
-moonbit_pty_write_fd(MoonBitPty *p) {
-  if (!p || !p->handle)
-    return -1;
-  return (int32_t)p->handle->master_fd;
-}
-
-MOONBIT_FFI_EXPORT
-int32_t
 moonbit_pty_take_read_fd(MoonBitPty *p) {
   if (!p || !p->handle)
     return -1;
@@ -1282,22 +1266,6 @@ moonbit_pty_resize(MoonBitPty *p, int32_t cols, int32_t rows) {
 }
 
 /* ---- read_fd ------------------------------------------------------------ */
-
-MOONBIT_FFI_EXPORT
-HANDLE
-moonbit_pty_read_fd(MoonBitPty *p) {
-  if (!p || !p->handle)
-    return INVALID_HANDLE_VALUE;
-  return p->handle->pipe_out_read;
-}
-
-MOONBIT_FFI_EXPORT
-HANDLE
-moonbit_pty_write_fd(MoonBitPty *p) {
-  if (!p || !p->handle)
-    return INVALID_HANDLE_VALUE;
-  return p->handle->pipe_in_write;
-}
 
 MOONBIT_FFI_EXPORT
 HANDLE

@@ -72,29 +72,47 @@ function pointer regardless of which thread called `fork()`.
 ## macOS: the self-helper pattern
 
 Since `fork()` is off limits, we use `posix_spawn()` (kernel-level spawn path
-that never triggers atfork handlers) to re-launch the current binary with
-special environment variables:
+that never triggers atfork handlers) to re-launch the current binary and use a
+`__attribute__((constructor))` function to intercept before `main()` runs.
 
-1. `openpty()` creates a PTY pair (master + slave fd)
-2. `posix_spawn()` launches the same executable with env vars:
+Plumbing between parent and helper is three env vars plus two inherited pipes:
+
+1. `openpty()` creates a PTY pair (master + slave fd).
+2. The parent creates two pipes — `argv_pipe` (parent → helper) and `err_pipe`
+   (helper → parent) — and passes the child-side fds to `posix_spawn()` via
+   `posix_spawn_file_actions_addinherit_np()` under `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+3. `posix_spawn()` launches the same executable with env vars:
    - `MOONBIT_PTY_EXEC=1` — signals helper mode
    - `MOONBIT_PTY_SLAVE_FD=<fd>` — the slave fd to use
-   - `MOONBIT_PTY_ARGC=<n>` and `MOONBIT_PTY_ARG{0..n-1}=<arg>` — the child argv
-3. A `__attribute__((constructor))` function in the child checks for
-   `MOONBIT_PTY_EXEC=1`, calls `login_tty()` + `execvp()`, and `_exit()`s
-   before `main()` ever runs
+   - `MOONBIT_PTY_ARGV_FD=<fd>` — read end of the argv pipe
+   - `MOONBIT_PTY_ERR_FD=<fd>` — write end of the error pipe
+4. The parent streams the target `argv` (flattened as `arg0\0arg1\0…argN\0`)
+   into `argv_pipe` and closes its write end.
+5. The constructor reads argv from `argv_pipe` until EOF, calls `login_tty()`,
+   arms `FD_CLOEXEC` on its copy of the error pipe, and `execvp()`s. A
+   successful exec auto-closes the error pipe so the parent sees EOF; any
+   pre-exec failure writes the errno to the pipe and `_exit()`s.
+6. The parent reads from the error pipe: 4 bytes → failure with that errno,
+   EOF → success.
 
 ### Why argv must be copied
 
-The parent copies the full user `argv` into env vars, and also re-spawns with
-the parent's own `argc`/`argv` as `posix_spawn()` arguments. This is **required**
-because in MoonBit debug mode, `_NSGetExecutablePath()` returns the path to
-`tcc` (MoonBit's interpreter), not the test/application binary. Re-spawning
-`tcc` without the original arguments means it doesn't know which compiled
-module to load — it would exit immediately without ever running the
-constructor that intercepts and execs the shell.
+The parent also re-spawns with its own `argc`/`argv` as `posix_spawn()`
+arguments (separate from the target argv that gets streamed through the pipe).
+This is **required** because in MoonBit debug mode, `_NSGetExecutablePath()`
+returns the path to `tcc` (MoonBit's interpreter), not the test/application
+binary. Re-spawning `tcc` without the original arguments means it doesn't know
+which compiled module to load — it would exit immediately without ever running
+the constructor that intercepts and execs the shell.
 
 In release mode, MoonBit compiles to a standalone native binary, so
 `_NSGetExecutablePath()` returns the actual binary with the constructor baked
 in. The extra argv is harmless in that case (the constructor fires before
 `main()` parses them).
+
+## Linux: forkpty with an error pipe
+
+Linux uses `forkpty()` + `execvp()` directly. A `pipe2(O_CLOEXEC)` error pipe
+wraps the fork the same way as the macOS helper: on exec success the pipe
+auto-closes (EOF = success); on failure the child writes its errno before
+`_exit()`ing.
