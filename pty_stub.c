@@ -209,8 +209,8 @@ moonbit_pty_finalizer(void *ptr) {
 #if defined(__APPLE__)
 #define MOONBIT_PTY_EXEC_ENV "MOONBIT_PTY_EXEC"
 #define MOONBIT_PTY_SLAVE_FD_ENV "MOONBIT_PTY_SLAVE_FD"
-#define MOONBIT_PTY_ARGC_ENV "MOONBIT_PTY_ARGC"
-#define MOONBIT_PTY_ARG_ENV_PREFIX "MOONBIT_PTY_ARG"
+#define MOONBIT_PTY_ARGV_FD_ENV "MOONBIT_PTY_ARGV_FD"
+#define MOONBIT_PTY_ERR_FD_ENV "MOONBIT_PTY_ERR_FD"
 #endif
 
 static void
@@ -219,6 +219,76 @@ pty_set_nonblocking(int fd) {
   if (flags >= 0) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   }
+}
+
+/* Blocking write of exactly `len` bytes of `errno` back to the parent.
+ * Retries on EINTR and short writes. The return value is intentionally
+ * ignored by callers: we're on a fatal path and if the error pipe is
+ * broken the parent will see EOF and fall back to its generic failure
+ * path. */
+static void
+pty_report_error(int err_fd, int err) {
+  int32_t val = (int32_t)err;
+  const char *p = (const char *)&val;
+  size_t remaining = sizeof(val);
+  while (remaining > 0) {
+    ssize_t n = write(err_fd, p, remaining);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return;
+    }
+    p += n;
+    remaining -= (size_t)n;
+  }
+}
+
+/* Blocking write of exactly `len` bytes from buf. Retries on EINTR and
+ * short writes. Returns 0 on full success, errno on failure (including
+ * EPIPE when the child died before reading). */
+static int
+pty_write_all(int fd, const void *buf, size_t len) {
+  const char *p = (const char *)buf;
+  while (len > 0) {
+    ssize_t n = write(fd, p, len);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return errno;
+    }
+    p += n;
+    len -= (size_t)n;
+  }
+  return 0;
+}
+
+/* Read exactly one int32 errno from the child's error pipe. Returns 1 if
+ * the child reported an errno (stored in *out), 0 on clean EOF (success
+ * — the write end was auto-closed on exec via FD_CLOEXEC), -1 on an
+ * unexpected read error or partial write. */
+static int
+pty_read_child_error(int fd, int32_t *out) {
+  char *p = (char *)out;
+  size_t remaining = sizeof(*out);
+  size_t total = 0;
+  while (remaining > 0) {
+    ssize_t n = read(fd, p, remaining);
+    if (n == 0)
+      break;
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    p += n;
+    remaining -= (size_t)n;
+    total += (size_t)n;
+  }
+  if (total == sizeof(*out))
+    return 1;
+  if (total == 0)
+    return 0;
+  return -1;
 }
 
 #if defined(__APPLE__)
@@ -239,43 +309,147 @@ pty_get_self_executable_path(void) {
   return path;
 }
 
-/*
- * Constructor-side unsetenv for all helper env vars. Called from the child
- * before exec so the target program doesn't inherit our plumbing vars.
- *
- * The per-arg vars (MOONBIT_PTY_ARG0, MOONBIT_PTY_ARG1, ...) are unset up to
- * argc; any stale ones beyond that are left alone since we don't know the
- * upper bound.
- */
+/* Constructor-side unsetenv so the target program doesn't inherit our
+ * plumbing vars. Argv is streamed through a pipe rather than encoded
+ * per-arg, so the set of helper vars is now fixed and small. */
 static void
-pty_unset_helper_env(int argc) {
+pty_unset_helper_env(void) {
   unsetenv(MOONBIT_PTY_EXEC_ENV);
   unsetenv(MOONBIT_PTY_SLAVE_FD_ENV);
-  unsetenv(MOONBIT_PTY_ARGC_ENV);
-  char name[64];
-  for (int i = 0; i < argc; i++) {
-    snprintf(name, sizeof(name), MOONBIT_PTY_ARG_ENV_PREFIX "%d", i);
-    unsetenv(name);
-  }
+  unsetenv(MOONBIT_PTY_ARGV_FD_ENV);
+  unsetenv(MOONBIT_PTY_ERR_FD_ENV);
 }
 
+/* Read the flattened argv buffer from argv_fd until EOF. Wire format is
+ * the same null-separated buffer the MoonBit side builds:
+ *   "arg0\0arg1\0...arg(n-1)\0"
+ * Returns 0 on success with *out_buf / *out_len populated, or an errno
+ * on failure. Caller owns *out_buf on success. */
 static int
-pty_exec_from_env(int slave_fd, int child_argc, char **child_argv) {
+pty_read_argv_buf(int argv_fd, char **out_buf, size_t *out_len) {
+  size_t cap = 256;
+  size_t len = 0;
+  char *buf = (char *)malloc(cap);
+  if (!buf)
+    return ENOMEM;
+  for (;;) {
+    if (len == cap) {
+      size_t new_cap = cap * 2;
+      char *new_buf = (char *)realloc(buf, new_cap);
+      if (!new_buf) {
+        free(buf);
+        return ENOMEM;
+      }
+      buf = new_buf;
+      cap = new_cap;
+    }
+    ssize_t n = read(argv_fd, buf + len, cap - len);
+    if (n == 0)
+      break;
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      int saved = errno;
+      free(buf);
+      return saved;
+    }
+    len += (size_t)n;
+  }
+  *out_buf = buf;
+  *out_len = len;
+  return 0;
+}
+
+/* Split the flat argv buffer in-place into a NULL-terminated argv array.
+ * The buffer is already a sequence of null-terminated strings, so the
+ * argv entries point directly into it. The buffer must stay alive until
+ * execvp runs. */
+static char **
+pty_argv_from_buf(char *buf, size_t len) {
+  if (len == 0 || buf[len - 1] != '\0')
+    return NULL;
+  int argc = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] == '\0')
+      argc++;
+  }
+  if (argc == 0)
+    return NULL;
+  char **argv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+  if (!argv)
+    return NULL;
+  int idx = 0;
+  char *p = buf;
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] == '\0') {
+      argv[idx++] = p;
+      p = buf + i + 1;
+    }
+  }
+  argv[argc] = NULL;
+  return argv;
+}
+
+/* Helper-mode body: read argv from argv_fd, attach the slave tty, execvp
+ * the target. Any pre-exec failure writes the errno to err_fd so the
+ * parent can surface it; a successful execvp auto-closes err_fd via
+ * FD_CLOEXEC, signalling EOF = success to the parent. */
+static int
+pty_exec_from_pipe(int argv_fd, int err_fd, int slave_fd) {
   sigset_t all_signals;
   sigfillset(&all_signals);
   sigprocmask(SIG_UNBLOCK, &all_signals, NULL);
   signal(SIGPIPE, SIG_DFL);
 
-  pty_unset_helper_env(child_argc);
+  char *buf = NULL;
+  size_t buf_len = 0;
+  int err = pty_read_argv_buf(argv_fd, &buf, &buf_len);
+  close(argv_fd);
+  if (err != 0) {
+    pty_report_error(err_fd, err);
+    return 127;
+  }
+
+  char **child_argv = pty_argv_from_buf(buf, buf_len);
+  if (!child_argv) {
+    pty_report_error(err_fd, EINVAL);
+    free(buf);
+    return 127;
+  }
+
+  pty_unset_helper_env();
 
   if (login_tty(slave_fd) < 0) {
+    pty_report_error(err_fd, errno);
     return 126;
   }
 
+  /* Ensure a successful execvp closes err_fd — the parent uses that EOF
+   * as its "exec succeeded" signal. addinherit_np under
+   * POSIX_SPAWN_CLOEXEC_DEFAULT clears FD_CLOEXEC on inherited fds in
+   * the new process, so we re-arm it here just before execvp. If execvp
+   * fails, the fd stays open (FD_CLOEXEC only acts on successful exec)
+   * and we can still report the errno below. */
+  fcntl(err_fd, F_SETFD, FD_CLOEXEC);
+
   execvp(child_argv[0], child_argv);
-  static const char msg[] = "exec failed\r\n";
-  (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  /* execvp only returns on failure. */
+  pty_report_error(err_fd, errno);
   return 127;
+}
+
+/* Parse a non-negative int fd from a decimal env-var string. Returns
+ * the fd on success, or -1 if the string is missing / malformed / out
+ * of range. */
+static int
+pty_parse_fd_env(const char *s) {
+  if (!s)
+    return -1;
+  char *end = NULL;
+  long v = strtol(s, &end, 10);
+  if (!end || *end != '\0' || v < 0 || v > INT32_MAX)
+    return -1;
+  return (int)v;
 }
 
 __attribute__((constructor)) static void
@@ -285,49 +459,18 @@ moonbit_pty_constructor(void) {
     return;
   }
 
-  const char *slave_fd_str = getenv(MOONBIT_PTY_SLAVE_FD_ENV);
-  const char *argc_str = getenv(MOONBIT_PTY_ARGC_ENV);
-  if (!slave_fd_str || !argc_str) {
+  int slave_fd = pty_parse_fd_env(getenv(MOONBIT_PTY_SLAVE_FD_ENV));
+  int argv_fd = pty_parse_fd_env(getenv(MOONBIT_PTY_ARGV_FD_ENV));
+  int err_fd = pty_parse_fd_env(getenv(MOONBIT_PTY_ERR_FD_ENV));
+  if (slave_fd < 0 || argv_fd < 0 || err_fd < 0) {
     _exit(127);
   }
 
-  char *end = NULL;
-  long fd_long = strtol(slave_fd_str, &end, 10);
-  if (!end || *end != '\0' || fd_long < 0 || fd_long > INT32_MAX) {
-    _exit(127);
-  }
-
-  long argc_long = strtol(argc_str, &end, 10);
-  if (!end || *end != '\0' || argc_long < 1 || argc_long > 1024) {
-    _exit(127);
-  }
-  int child_argc = (int)argc_long;
-
-  /* Reassemble argv from MOONBIT_PTY_ARG0 .. MOONBIT_PTY_ARG(n-1) */
-  char **child_argv = (char **)calloc((size_t)child_argc + 1, sizeof(char *));
-  if (!child_argv) {
-    _exit(127);
-  }
-  char name[64];
-  for (int i = 0; i < child_argc; i++) {
-    snprintf(name, sizeof(name), MOONBIT_PTY_ARG_ENV_PREFIX "%d", i);
-    const char *val = getenv(name);
-    if (!val) {
-      _exit(127);
-    }
-    child_argv[i] = strdup(val);
-    if (!child_argv[i]) {
-      _exit(127);
-    }
-  }
-  child_argv[child_argc] = NULL;
-
-  _exit(pty_exec_from_env((int)fd_long, child_argc, child_argv));
+  _exit(pty_exec_from_pipe(argv_fd, err_fd, slave_fd));
 }
 
 static int
 pty_is_helper_env_name(const char *entry) {
-  /* Exact matches for fixed helper vars */
   if (strncmp(entry, MOONBIT_PTY_EXEC_ENV "=", sizeof(MOONBIT_PTY_EXEC_ENV)) ==
       0)
     return 1;
@@ -335,19 +478,14 @@ pty_is_helper_env_name(const char *entry) {
         entry, MOONBIT_PTY_SLAVE_FD_ENV "=", sizeof(MOONBIT_PTY_SLAVE_FD_ENV)
       ) == 0)
     return 1;
-  if (strncmp(entry, MOONBIT_PTY_ARGC_ENV "=", sizeof(MOONBIT_PTY_ARGC_ENV)) ==
-      0)
+  if (strncmp(
+        entry, MOONBIT_PTY_ARGV_FD_ENV "=", sizeof(MOONBIT_PTY_ARGV_FD_ENV)
+      ) == 0)
     return 1;
-  /* Prefix match for the variable-count MOONBIT_PTY_ARG{0,1,...} series.
-   * Strip only if the char after the prefix is a digit (so we don't
-   * accidentally consume a user var named MOONBIT_PTY_ARGUMENTS). */
-  size_t prefix_len = sizeof(MOONBIT_PTY_ARG_ENV_PREFIX) - 1;
-  if (strncmp(entry, MOONBIT_PTY_ARG_ENV_PREFIX, prefix_len) == 0) {
-    char c = entry[prefix_len];
-    if (c >= '0' && c <= '9') {
-      return 1;
-    }
-  }
+  if (strncmp(
+        entry, MOONBIT_PTY_ERR_FD_ENV "=", sizeof(MOONBIT_PTY_ERR_FD_ENV)
+      ) == 0)
+    return 1;
   return 0;
 }
 
@@ -374,14 +512,14 @@ pty_make_spawn_argv(const char *self_path) {
 /*
  * Build the environment for the self-exec'd helper child.
  *
- * The child inherits everything from the parent except our own helper vars
- * (MOONBIT_PTY_EXEC / MOONBIT_PTY_SLAVE_FD / MOONBIT_PTY_ARGC /
- * MOONBIT_PTY_ARG{0,1,...}), which we strip and re-emit fresh. The per-arg
- * vars encode the target argv so the constructor-side helper can reassemble
- * it without needing to carry pointers across posix_spawn.
+ * The child inherits everything from the parent except our own helper vars,
+ * which we strip and re-emit fresh. The target argv is streamed through an
+ * inherited pipe (argv_fd) rather than encoded into env, and exec failures
+ * are reported back through a second pipe (err_fd); both fds are passed to
+ * the helper by number via env.
  */
 static char **
-pty_make_spawn_env(int slave_fd, int child_argc, char **child_argv) {
+pty_make_spawn_env(int slave_fd, int argv_fd, int err_fd) {
   char **current_env = *_NSGetEnviron();
   size_t env_count = 0;
   size_t keep_count = 0;
@@ -392,10 +530,8 @@ pty_make_spawn_env(int slave_fd, int child_argc, char **child_argv) {
     env_count += 1;
   }
 
-  /* Slots needed: kept-from-parent + EXEC + SLAVE_FD + ARGC + argc entries +
-   * terminator */
-  size_t extra = 3 + (size_t)child_argc + 1;
-  char **child_env = (char **)calloc(keep_count + extra, sizeof(char *));
+  /* Slots needed: kept-from-parent + 4 helper vars + terminator */
+  char **child_env = (char **)calloc(keep_count + 5, sizeof(char *));
   if (!child_env) {
     return NULL;
   }
@@ -408,45 +544,26 @@ pty_make_spawn_env(int slave_fd, int child_argc, char **child_argv) {
   }
 
   char *helper_mode = strdup(MOONBIT_PTY_EXEC_ENV "=1");
-  char *slave_fd_env = (char *)malloc(64);
-  char *argc_env = (char *)malloc(64);
-  if (!helper_mode || !slave_fd_env || !argc_env) {
+  char *slave_env = (char *)malloc(64);
+  char *argv_env = (char *)malloc(64);
+  char *err_env = (char *)malloc(64);
+  if (!helper_mode || !slave_env || !argv_env || !err_env) {
     free(helper_mode);
-    free(slave_fd_env);
-    free(argc_env);
+    free(slave_env);
+    free(argv_env);
+    free(err_env);
     free(child_env);
     return NULL;
   }
 
-  snprintf(slave_fd_env, 64, MOONBIT_PTY_SLAVE_FD_ENV "=%d", slave_fd);
-  snprintf(argc_env, 64, MOONBIT_PTY_ARGC_ENV "=%d", child_argc);
+  snprintf(slave_env, 64, MOONBIT_PTY_SLAVE_FD_ENV "=%d", slave_fd);
+  snprintf(argv_env, 64, MOONBIT_PTY_ARGV_FD_ENV "=%d", argv_fd);
+  snprintf(err_env, 64, MOONBIT_PTY_ERR_FD_ENV "=%d", err_fd);
 
   child_env[dst++] = helper_mode;
-  child_env[dst++] = slave_fd_env;
-  child_env[dst++] = argc_env;
-
-  /* One env entry per argv[i]: MOONBIT_PTY_ARG{i}=<value> */
-  for (int i = 0; i < child_argc; i++) {
-    size_t val_len = strlen(child_argv[i]);
-    /* Prefix + digits (up to 12) + '=' + value + '\0' */
-    size_t buf_len = sizeof(MOONBIT_PTY_ARG_ENV_PREFIX) + 12 + 1 + val_len + 1;
-    char *entry = (char *)malloc(buf_len);
-    if (!entry) {
-      /* Free what we allocated for this call; parent-inherited entries
-       * stay with the parent (not owned by us). */
-      for (size_t j = 0; j < dst; j++) {
-        if (pty_is_helper_env_name(child_env[j])) {
-          free(child_env[j]);
-        }
-      }
-      free(child_env);
-      return NULL;
-    }
-    snprintf(
-      entry, buf_len, MOONBIT_PTY_ARG_ENV_PREFIX "%d=%s", i, child_argv[i]
-    );
-    child_env[dst++] = entry;
-  }
+  child_env[dst++] = slave_env;
+  child_env[dst++] = argv_env;
+  child_env[dst++] = err_env;
   child_env[dst] = NULL;
   return child_env;
 }
@@ -473,13 +590,17 @@ pty_spawn_via_self_helper(
   int32_t cols,
   int32_t rows
 ) {
-  char **target_argv = pty_parse_argv_flat(argv_flat, argc);
+  if (argc <= 0 || !argv_flat) {
+    return pty_make_failure((int32_t)EINVAL);
+  }
+  int32_t flat_len = (int32_t)Moonbit_array_length(argv_flat);
+  if (flat_len <= 0) {
+    return pty_make_failure((int32_t)EINVAL);
+  }
+
   char *self_path = pty_get_self_executable_path();
-  if (!target_argv || !self_path) {
-    int32_t saved = (int32_t)(errno ? errno : ENOMEM);
-    pty_free_argv(target_argv);
-    free(self_path);
-    return pty_make_failure(saved);
+  if (!self_path) {
+    return pty_make_failure((int32_t)(errno ? errno : ENOMEM));
   }
 
   struct winsize ws;
@@ -491,43 +612,77 @@ pty_spawn_via_self_helper(
   int slave_fd = -1;
   if (openpty(&master_fd, &slave_fd, NULL, NULL, &ws) < 0) {
     int32_t saved = (int32_t)errno;
-    pty_free_argv(target_argv);
     free(self_path);
     return pty_make_failure(saved);
   }
-
   pty_set_nonblocking(master_fd);
+
+  /* argv_pipe: parent writes the flattened argv, helper reads it in the
+   * constructor. err_pipe: helper writes errno on any pre-exec failure;
+   * a successful execvp auto-closes the write end via FD_CLOEXEC, which
+   * gives the parent an EOF = success signal. */
+  int argv_pipe[2] = { -1, -1 };
+  int err_pipe[2] = { -1, -1 };
+
+  if (pipe(argv_pipe) < 0) {
+    int32_t saved = (int32_t)errno;
+    close(master_fd);
+    close(slave_fd);
+    free(self_path);
+    return pty_make_failure(saved);
+  }
+  if (pipe(err_pipe) < 0) {
+    int32_t saved = (int32_t)errno;
+    close(argv_pipe[0]);
+    close(argv_pipe[1]);
+    close(master_fd);
+    close(slave_fd);
+    free(self_path);
+    return pty_make_failure(saved);
+  }
+  /* The helper sets FD_CLOEXEC on its copy of err_pipe[1] just before
+   * execvp, so we don't need to do it here. (addinherit_np under
+   * POSIX_SPAWN_CLOEXEC_DEFAULT clears FD_CLOEXEC on inherited fds
+   * anyway.) */
 
   posix_spawn_file_actions_t file_actions;
   posix_spawnattr_t attr;
   int spawn_err = posix_spawn_file_actions_init(&file_actions);
   if (spawn_err != 0) {
+    close(argv_pipe[0]);
+    close(argv_pipe[1]);
+    close(err_pipe[0]);
+    close(err_pipe[1]);
     close(master_fd);
     close(slave_fd);
-    pty_free_argv(target_argv);
     free(self_path);
     return pty_make_failure((int32_t)spawn_err);
   }
   spawn_err = posix_spawnattr_init(&attr);
   if (spawn_err != 0) {
     posix_spawn_file_actions_destroy(&file_actions);
+    close(argv_pipe[0]);
+    close(argv_pipe[1]);
+    close(err_pipe[0]);
+    close(err_pipe[1]);
     close(master_fd);
     close(slave_fd);
-    pty_free_argv(target_argv);
     free(self_path);
     return pty_make_failure((int32_t)spawn_err);
   }
 
   spawn_err = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-  if (spawn_err == 0) {
+  if (spawn_err == 0)
     spawn_err = posix_spawn_file_actions_addinherit_np(&file_actions, slave_fd);
-  }
+  if (spawn_err == 0)
+    spawn_err =
+      posix_spawn_file_actions_addinherit_np(&file_actions, argv_pipe[0]);
+  if (spawn_err == 0)
+    spawn_err =
+      posix_spawn_file_actions_addinherit_np(&file_actions, err_pipe[1]);
 
-  /* spawn_argv is argv for the *self-reexec* (same binary being re-run as
-   * a constructor helper); target_argv is what we want the constructor to
-   * execvp once it's running. */
   char **spawn_argv = pty_make_spawn_argv(self_path);
-  char **child_env = pty_make_spawn_env(slave_fd, argc, target_argv);
+  char **child_env = pty_make_spawn_env(slave_fd, argv_pipe[0], err_pipe[1]);
   if (!spawn_argv || !child_env) {
     spawn_err = ENOMEM;
   }
@@ -540,15 +695,52 @@ pty_spawn_via_self_helper(
 
   posix_spawn_file_actions_destroy(&file_actions);
   posix_spawnattr_destroy(&attr);
-  close(slave_fd);
   free(spawn_argv);
   pty_free_spawn_env(child_env);
-  pty_free_argv(target_argv);
   free(self_path);
 
+  /* Parent keeps only its own ends: argv_pipe[1] to write, err_pipe[0]
+   * to read. Closing err_pipe[1] here is what lets the parent's read()
+   * reach EOF once the helper's copy closes (either via FD_CLOEXEC on
+   * successful exec, or via process exit). */
+  close(slave_fd);
+  close(argv_pipe[0]);
+  close(err_pipe[1]);
+
   if (spawn_err != 0) {
+    close(argv_pipe[1]);
+    close(err_pipe[0]);
     close(master_fd);
     return pty_make_failure((int32_t)spawn_err);
+  }
+
+  /* Stream argv to the helper. EPIPE (helper died before reading) isn't
+   * fatal here — we'll surface the real reason from the error pipe. */
+  (void)pty_write_all(argv_pipe[1], argv_flat, (size_t)flat_len);
+  close(argv_pipe[1]);
+
+  int32_t child_err = 0;
+  int got = pty_read_child_error(err_pipe[0], &child_err);
+  close(err_pipe[0]);
+
+  if (got == 1) {
+    /* Helper reported a pre-exec failure; reap it before returning. */
+    int status;
+    (void)waitpid(pid, &status, 0);
+    close(master_fd);
+    return pty_make_failure(child_err);
+  }
+  if (got == 0) {
+    /* EOF without errno normally means a successful execvp. But a helper
+     * killed before it could write would also look like this, so do a
+     * non-blocking waitpid to make sure we're not handing back a PID
+     * that's already gone. */
+    int status;
+    pid_t ret = waitpid(pid, &status, WNOHANG);
+    if (ret == pid) {
+      close(master_fd);
+      return pty_make_failure((int32_t)EIO);
+    }
   }
 
   pty_handle_t *h = (pty_handle_t *)calloc(1, sizeof(pty_handle_t));
@@ -616,6 +808,18 @@ moonbit_pty_spawn(
   if (!child_argv)
     return pty_make_failure((int32_t)(errno ? errno : ENOMEM));
 
+  /* CLOEXEC error pipe: the child writes its errno to this pipe on any
+   * pre-exec failure, and a successful execvp auto-closes the write end
+   * so the parent sees EOF = success. pipe2(O_CLOEXEC) is atomic on
+   * Linux/FreeBSD, avoiding a race where a concurrent fork in another
+   * thread could inherit the fd. */
+  int err_pipe[2] = { -1, -1 };
+  if (pipe2(err_pipe, O_CLOEXEC) < 0) {
+    int32_t saved = (int32_t)errno;
+    pty_free_argv(child_argv);
+    return pty_make_failure(saved);
+  }
+
   struct winsize ws;
   memset(&ws, 0, sizeof(ws));
   ws.ws_col = (unsigned short)cols;
@@ -627,12 +831,15 @@ moonbit_pty_spawn(
   if (pid < 0) {
     /* forkpty failed */
     int32_t saved = (int32_t)errno;
+    close(err_pipe[0]);
+    close(err_pipe[1]);
     pty_free_argv(child_argv);
     return pty_make_failure(saved);
   }
 
   if (pid == 0) {
     /* ---- child process ---- */
+    close(err_pipe[0]);
 
     /* Reset signal mask — the MoonBit async runtime blocks SIGCHLD
        and ignores SIGPIPE; the child inherits both across fork.
@@ -642,16 +849,28 @@ moonbit_pty_spawn(
     sigprocmask(SIG_UNBLOCK, &all_signals, NULL);
     signal(SIGPIPE, SIG_DFL);
 
-    /* PATH lookup via execvp so `tun-server nvim` resolves via $PATH. */
+    /* PATH lookup via execvp so `tun-server nvim` resolves via $PATH.
+     * err_pipe[1] has O_CLOEXEC, so success auto-closes it for us. */
     execvp(child_argv[0], child_argv);
-    /* If exec fails, write a minimal error to the PTY. */
-    static const char msg[] = "exec failed\r\n";
-    (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    /* exec failed — report the errno to the parent. */
+    pty_report_error(err_pipe[1], errno);
     _exit(127);
   }
 
   /* ---- parent process ---- */
   pty_free_argv(child_argv);
+  close(err_pipe[1]);
+
+  int32_t child_err = 0;
+  int got = pty_read_child_error(err_pipe[0], &child_err);
+  close(err_pipe[0]);
+
+  if (got == 1) {
+    int status;
+    (void)waitpid(pid, &status, 0);
+    close(master_fd);
+    return pty_make_failure(child_err);
+  }
 
   /* Set master fd to non-blocking for async reads. */
   pty_set_nonblocking(master_fd);

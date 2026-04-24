@@ -127,3 +127,25 @@ async test "spawn resolves program via PATH" {
 
   assert_true(found)
 }
+
+///|
+/// Spawning a program that doesn't exist must surface the exec failure
+/// as an OSError, not silently return a live-looking Pty whose child
+/// already died. Exercises the error-reporting pipe from the child
+/// helper (macOS) / post-fork exec path (Linux).
+#cfg(not(platform="windows"))
+async test "spawn reports exec failure for missing program" {
+  let err = try {
+    let pty = Pty::spawn(["/nonexistent/program/xyzzy"])
+    pty.close()
+    None
+  } catch {
+    e => Some(e)
+  }
+  inspect(
+    err,
+    content=(
+      #|Some(OSError("Pty::spawn: No such file or directory"))
+    ),
+  )
+}
